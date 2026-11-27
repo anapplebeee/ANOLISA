@@ -986,6 +986,63 @@ fn reclaim_preserves_unreadable_archives_at_mount_open() {
 }
 
 #[test]
+fn reclaim_preserves_snapshot_when_sidecar_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let (_tmp, svc) = setup();
+    svc.write("notes.md", "backup contents", false).unwrap();
+    let snapshot = svc.mem_snapshot(Some("keep this label")).unwrap();
+    let dir = svc.mount.meta_dir.join("snapshots");
+    let archive = dir.join(format!("{}.tar.gz", snapshot.id));
+    let sidecar = dir.join(format!("{}.json", snapshot.id));
+    let archive_bytes = std::fs::read(&archive).unwrap();
+    let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+    let sidecar_mode = std::fs::metadata(&sidecar).unwrap().permissions();
+    age_file(&archive, 2 * 24 * 3600);
+    age_file(&sidecar, 2 * 24 * 3600);
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let config = svc.config.clone();
+    drop(svc);
+
+    // Mount opening is the production sweep. A temporary metadata read
+    // failure must not discard a restorable archive.
+    let svc = MemoryService::new(config.clone()).unwrap();
+    assert!(
+        archive.exists(),
+        "an unreadable sidecar must not discard its archive at mount open"
+    );
+    assert!(sidecar.exists());
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.validation_failures, 1);
+    assert_eq!(report.archives_removed, 0);
+    assert_eq!(report.sidecars_removed, 0);
+    assert_eq!(report.sidecars_repaired, 0);
+    assert_eq!(report.invalid_archives_removed, 0);
+    assert_eq!(report.total_removed(), 0);
+    assert_eq!(report.removal_failures, 0);
+    std::fs::set_permissions(&sidecar, sidecar_mode).unwrap();
+    assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+    assert_eq!(std::fs::read(&archive).unwrap(), archive_bytes);
+    drop(svc);
+
+    let svc = MemoryService::new(config).unwrap();
+    assert_eq!(svc.mem_snapshot_list().unwrap()[0].name, "keep this label");
+    svc.write("notes.md", "live contents", true).unwrap();
+    svc.mem_snapshot_restore(&snapshot.id).unwrap();
+    assert_eq!(svc.read("notes.md").unwrap(), "backup contents");
+}
+
+#[test]
 fn reclaim_keeps_young_sidecar_after_discarding_invalid_archive() {
     let (_tmp, svc) = setup();
     let dir = svc.mount.meta_dir.join("snapshots");

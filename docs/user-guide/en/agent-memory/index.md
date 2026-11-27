@@ -702,10 +702,13 @@ guard. Invalid archives are deleted and counted separately in the sweep
 summary; their sidecars are removed once they too exceed the age guard.
 Valid pairs are retained without rewriting their metadata. This validation
 reads each eligible archive in full during mount opening.
-If opening or reading an archive fails, the sweep retains the archive and
-its sidecar, logs a warning, and counts a validation failure. Permission or
-storage access failures do not establish corruption; restore access and
-open the mount again to retry validation.
+If opening or reading an archive fails, or a regular sidecar file is
+present but cannot be read, the sweep retains the archive and its sidecar,
+logs a warning, and counts a validation failure. Permission or storage
+access failures do not establish corruption or a missing sidecar; restore
+access and open the mount again to retry validation. A missing sidecar, or
+a directory occupying the sidecar name, is still an orphan archive and is
+removed after the age guard.
 
 `mem_snapshot_list` excludes entries without a regular archive file; it does
 not perform a full integrity check. A directory named `<id>.tar.gz` cannot

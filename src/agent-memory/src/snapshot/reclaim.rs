@@ -9,7 +9,9 @@
 //! 2. sidecar-less `*.tar.gz` — the rename landed but the sidecar write
 //!    failed or the process died first. `list_tarballs` enumerates
 //!    `*.json` only, so the archive is invisible to every user-facing
-//!    operation while still occupying disk.
+//!    operation while still occupying disk. A sidecar that is present
+//!    but unreadable is not this case: the pair is retained and counted
+//!    as a validation failure so a later sweep can retry.
 //! 3. orphan `*.json` — a sidecar without a regular archive file. With no archive
 //!    there is no restore path (`restore_tarball` checks the archive
 //!    first), so the sidecar is dead weight.
@@ -59,8 +61,13 @@ enum SidecarState {
     Parseable,
     /// Readable but unparseable — repairable.
     Corrupt,
-    /// Resolvable but unreadable, or not there at all — not repairable.
+    /// No regular sidecar file at this name (missing, or a directory).
+    /// An aged archive is removed because list/restore cannot see it.
     Absent,
+    /// The sidecar is present but its bytes could not be read. A
+    /// permission or I/O error is not evidence the metadata is missing,
+    /// so the pair is retained for a later sweep.
+    Unreadable(String),
     /// A symlink on the resolution path (or a mount crossing) — the name
     /// was not put there by `create_tarball`. Not repairable; the archive
     /// is discarded and the pair is reported as `tampered_pairs` so
@@ -92,7 +99,8 @@ pub struct ReclaimReport {
     pub archives_removed: usize,
     /// Invalid archives discarded, included in `archives_removed`.
     pub invalid_archives_removed: usize,
-    /// Archives retained because opening or reading them failed.
+    /// Archives retained because opening or reading the archive, or
+    /// reading its sidecar, failed.
     pub validation_failures: usize,
     /// `*.json` sidecars removed for having no regular archive file.
     pub sidecars_removed: usize,
@@ -414,10 +422,18 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
                 // and surface it as a failure rather than repair through
                 // the link.
                 Err(crate::error::MemoryError::PathOutsideMount(_)) => SidecarState::Tampered,
-                // Unreadable or unresolvable (dangling symlink, permissions,
-                // vanished inode): not repairable — treated like an absent
-                // sidecar. The link itself is never followed.
-                Err(_) => SidecarState::Absent,
+                // ENOENT is a missing sidecar. EISDIR is a directory
+                // occupying the sidecar name: neither is metadata, so the
+                // aged archive stays on the orphan path. Any other read
+                // error (EACCES, EIO, a short read) leaves the bytes in
+                // place; deleting the archive would make a restorable
+                // snapshot unrecoverable once the read succeeds again.
+                // The link itself is never followed.
+                Err(MemoryError::NotFound(_)) => SidecarState::Absent,
+                Err(MemoryError::Io(error)) if error.kind() == io::ErrorKind::IsADirectory => {
+                    SidecarState::Absent
+                }
+                Err(error) => SidecarState::Unreadable(error.to_string()),
             };
         match sidecar_state {
             SidecarState::Parseable | SidecarState::Corrupt => {
@@ -524,11 +540,26 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
                     }
                 }
             }
+            SidecarState::Unreadable(error) => {
+                // Present but unreadable metadata. Keep both names. A young
+                // archive is left alone under the same age guard as every
+                // other shape; an aged pair is counted so the warning is
+                // visible without discarding the backup.
+                if !older_than_anchored(mount.root_fd.as_fd(), &archive_rel, min_age, now) {
+                    report.kept_young += 1;
+                } else {
+                    report.validation_failures += 1;
+                    tracing::warn!(
+                        "snapshot reclaim: cannot read sidecar {} for {}; retaining archive and sidecar: {error}",
+                        sidecar.display(),
+                        archive.display()
+                    );
+                }
+            }
             SidecarState::Absent => {
-                // No readable sidecar (absent, dangling, or unreadable):
-                // the archive is invisible to list/restore; past the age
-                // guard it is dead weight. The link itself is never
-                // followed and never repaired through.
+                // No sidecar file: the archive is invisible to list/restore;
+                // past the age guard it is dead weight. The link itself is
+                // never followed and never repaired through.
                 if !older_than_anchored(mount.root_fd.as_fd(), &archive_rel, min_age, now) {
                     report.kept_young += 1;
                     continue;
