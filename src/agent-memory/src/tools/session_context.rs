@@ -173,27 +173,26 @@ struct FactEntry {
 /// Returns (frontmatter_map, body).
 fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
     let mut fm = HashMap::new();
-    if let Some(rest) = content.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---\n") {
-            let fm_str = &rest[..end];
-            let body = rest[end + 5..].to_string();
-            for line in fm_str.lines() {
-                if let Some(item) = line.strip_prefix("  - ") {
-                    // List item — skip for flat parsing
-                    let _ = item;
-                    continue;
-                }
-                if let Some((key, value)) = line.split_once(": ") {
-                    let value = unquote_yaml(value.trim());
-                    fm.insert(key.trim().to_string(), value);
-                } else if let Some(key) = line.strip_suffix(':') {
-                    fm.insert(key.trim().to_string(), String::new());
-                }
-            }
-            return (fm, body);
+    // Same fence rule as export and the body extractors. A summary whose
+    // closing `---` ends the file, or whose closing line uses `\r\n`, still
+    // has a category; requiring `\n---\n` drops it from Recent Sessions.
+    let Some((fm_str, body)) = super::frontmatter::split(content) else {
+        return (fm, content.to_string());
+    };
+    for line in fm_str.lines() {
+        if let Some(item) = line.strip_prefix("  - ") {
+            // List item — skip for flat parsing
+            let _ = item;
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(": ") {
+            let value = unquote_yaml(value.trim());
+            fm.insert(key.trim().to_string(), value);
+        } else if let Some(key) = line.strip_suffix(':') {
+            fm.insert(key.trim().to_string(), String::new());
         }
     }
-    (fm, content.to_string())
+    (fm, body.to_string())
 }
 
 /// Strip YAML double-quotes from a frontmatter value.
@@ -233,6 +232,31 @@ mod tests {
         assert_eq!(fm.get("title").unwrap(), "Test session");
         assert_eq!(fm.get("session_id").unwrap(), "ses-1");
         assert!(body.contains("Session body text"));
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_closing_fence_at_eof() {
+        // A summary whose closing fence ends the file still carries its
+        // category, so memory_session_context can include it.
+        let content =
+            "---\ncategory: summary\ntitle: \"Standup\"\ncreated_at: 2026-01-01T00:00:00Z\n---";
+        let (fm, body) = parse_frontmatter(content);
+        assert_eq!(fm.get("category").map(String::as_str), Some("summary"));
+        assert_eq!(fm.get("title").map(String::as_str), Some("Standup"));
+        assert_eq!(
+            fm.get("created_at").map(String::as_str),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_crlf_closing_fence() {
+        let content = "---\ncategory: summary\ntitle: \"Standup\"\r\n---\r\nSession notes\n";
+        let (fm, body) = parse_frontmatter(content);
+        assert_eq!(fm.get("category").map(String::as_str), Some("summary"));
+        assert_eq!(fm.get("title").map(String::as_str), Some("Standup"));
+        assert_eq!(body, "Session notes\n");
     }
 
     #[test]

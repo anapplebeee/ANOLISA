@@ -286,12 +286,18 @@ fn extract_title_and_description(content: &str, fallback_path: &str) -> (String,
         }
     }
 
-    // Fallback description: first line of body
+    // Fallback description: first line of body. A frontmatter block uses the
+    // shared fence splitter, so a file that ends on `---` does not take the
+    // fence line itself as the description. A document with no frontmatter
+    // keeps the historical scan.
     if description.is_empty() {
-        let body = content
-            .find("\n---\n")
-            .map(|pos| &content[pos + 5..])
-            .unwrap_or(content);
+        let body = match super::frontmatter::split(content) {
+            Some((_, body)) => body,
+            None => content
+                .find("\n---\n")
+                .map(|pos| &content[pos + 5..])
+                .unwrap_or(content),
+        };
         let first_line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
         description = first_line.chars().take(80).collect::<String>();
     }
@@ -518,6 +524,24 @@ mod tests {
         let (title, desc) = extract_title_and_description(content, "fallback.md");
         assert_eq!(title, "JWT Auth Decision");
         assert_eq!(desc, "[project]");
+    }
+
+    #[test]
+    fn description_does_not_become_the_closing_fence() {
+        // No hint, category, or body, and the closing fence ends the file.
+        // The description is empty; it is not the fence line.
+        let content = "---\ntitle: \"Hello\"\n---";
+        let (title, desc) = extract_title_and_description(content, "notes/x.md");
+        assert_eq!(title, "Hello");
+        assert_eq!(desc, "");
+    }
+
+    #[test]
+    fn description_uses_the_body_after_the_fence() {
+        let content = "---\ntitle: \"Hello\"\n---\n\nFirst line of the note\n";
+        let (title, desc) = extract_title_and_description(content, "notes/x.md");
+        assert_eq!(title, "Hello");
+        assert_eq!(desc, "First line of the note");
     }
 
     #[test]

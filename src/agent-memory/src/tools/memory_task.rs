@@ -214,13 +214,10 @@ fn validate_task_id(id: &str) -> Result<()> {
 
 /// Parse a task from markdown content with YAML frontmatter.
 fn parse_task(content: &str) -> Result<Task> {
-    // Split frontmatter and body.
-    let (frontmatter, body) = content
-        .strip_prefix("---\n")
-        .and_then(|rest| {
-            rest.find("\n---\n")
-                .map(|pos| (&rest[..pos], &rest[pos + 5..]))
-        })
+    // A closing fence may end the file, and its terminator may be `\n` or
+    // `\r\n`. Requiring `\n---\n` rejects both, so `memory_task_list` skips
+    // the file and resume reports a missing frontmatter block.
+    let (frontmatter, body) = super::frontmatter::split(content)
         .ok_or_else(|| MemoryError::Other("invalid task file: missing frontmatter".into()))?;
 
     // Parse frontmatter as YAML (using serde_yaml via serde_json roundtrip).
@@ -817,6 +814,48 @@ mod tests {
         let (_tmp, svc) = setup();
         let result = memory_task_resume(&svc, "nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_file_ending_at_closing_fence_stays_listed() {
+        let (_tmp, svc) = setup();
+        let tasks_dir = svc.mount.root.join(TASKS_DIR);
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        // mem_write stores the bytes it is given. A closing fence that ends
+        // the file is still a task, and the listing must not skip it.
+        let content = "---\nid: eof-task\ntitle: \"Fence ends the file\"\nstatus: in-progress\nprogress: 10\ncreated_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-02T00:00:00Z\n---";
+        std::fs::write(tasks_dir.join("eof-task.md"), content).unwrap();
+
+        let tasks = load_all_tasks(&svc).unwrap();
+        assert_eq!(tasks.len(), 1, "a closing fence at EOF is still a task");
+        assert_eq!(tasks[0].id, "eof-task");
+        assert_eq!(tasks[0].title, "Fence ends the file");
+        assert_eq!(tasks[0].progress, 10);
+        assert_eq!(tasks[0].context, "");
+
+        let resume = memory_task_resume(&svc, "eof-task").unwrap();
+        assert!(
+            resume.contains("Fence ends the file"),
+            "resume must read the same file, got: {resume}"
+        );
+    }
+
+    #[test]
+    fn parse_task_reads_crlf_closing_fence() {
+        // The opening fence stays "---\n". The closing line may use CRLF,
+        // and the body starts on the following line.
+        let content = "---\nid: crlf\ntitle: \"CRLF fence\"\nstatus: blocked\nprogress: 3\ncreated_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-02T00:00:00Z\r\n---\r\nnotes\n";
+        let task = parse_task(content).unwrap();
+        assert_eq!(task.title, "CRLF fence");
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.progress, 3);
+        assert_eq!(task.context, "notes\n");
+    }
+
+    #[test]
+    fn parse_task_still_rejects_an_unclosed_fence() {
+        let content = "---\nid: t1\ntitle: Hello\nstatus: in-progress\n";
+        assert!(parse_task(content).is_err());
     }
 
     #[test]
